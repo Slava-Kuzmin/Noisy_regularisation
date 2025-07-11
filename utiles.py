@@ -49,6 +49,50 @@ def parallel_experiments(
     return futures
 
 
+from experiments_IBM_run import run_experiment_task_IBM
+# ---------------------------
+def parallel_experiments_IBM(
+    args,                    # Dictionary of hyperparameters
+    target_epochs,           # Scalar: number of training epochs
+    n_trajectories,          # Scalar: number of trajectory runs
+    db_path,                 # MLflow database URI
+    prune_callback,          # Optional: Optuna prune callback or None
+    print_output,            # Bool: whether to print output
+    use_mlflow,              # Bool: whether to log to MLflow
+    smoothing,               # Float: smoothing for classification loss
+    test_size,               # Float: test split ratio
+    val_size,                # Float: validation split ratio
+    experiment_name          # String: name for the MLflow experiment
+):
+    """
+    Runs experiments in parallel using Celery for the Cartesian product of hyperparameters
+    and multiple trajectory indices.
+    """
+    keys = list(args.keys())
+    values_list = [
+        list(args[k]) if isinstance(args[k], (list, tuple, np.ndarray)) else [args[k]]
+        for k in keys
+    ]
+
+    tasks = []
+    for combination in product(*values_list):
+        base_param_dict = {k: v for k, v in zip(keys, combination)}
+        for traj in range(n_trajectories):
+            task_param_dict = base_param_dict.copy()
+            task_param_dict["ind_trajectory"] = traj
+            tasks.append(task_param_dict)
+
+    # Submit each task asynchronously using Celery
+    futures = []
+    for param_dict in tasks:
+        future = run_experiment_task_IBM.delay(
+            param_dict, target_epochs, db_path, prune_callback,
+            print_output, use_mlflow, smoothing, test_size, val_size, experiment_name
+        )
+        futures.append(future)
+
+    return futures
+
 import pandas as pd
 import numpy as np
 import math

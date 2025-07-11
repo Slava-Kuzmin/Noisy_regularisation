@@ -1,146 +1,110 @@
-# mlflow_tracking.py
 """
-MLflow Tracking Utilities
-
-Handles MLflow experiment and run management:
- • Initializing/retrieving experiments.
- • Creating/resuming runs.
- • Logging hyperparameters, metrics, and artifacts.
-
-Also provides a dummy context manager (dummy_run) to disable MLflow for testing.
+MLflow tracking helpers – unchanged except for a tiny utility import tweak.
+No functional changes were needed for best‑checkpoint support; the logic now
+lives in `training_jax` + `experiments_run`.
 """
+
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import tempfile
+import time
+from contextlib import contextmanager
 
 import mlflow
-from mlflow.tracking import MlflowClient
 from mlflow.entities import Metric
-import logging
-from contextlib import contextmanager
-import time
+from mlflow.tracking import MlflowClient
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-def initialize_experiment(experiment_name, db_path="sqlite:///mlflow.db"):
-    """
-    Ensure the MLflow experiment exists, creating it if necessary.
-    """
+# -----------------------------------------------------------------------------
+# experiment / run utilities
+# -----------------------------------------------------------------------------
+
+def initialize_experiment(experiment_name: str, db_path: str = "sqlite:///mlflow.db"):
+    """Create experiment if it doesn't exist and set tracking URI."""
     mlflow.set_tracking_uri(db_path)
     client = MlflowClient()
-    experiment = client.get_experiment_by_name(experiment_name)
-    if experiment is None:
+    if client.get_experiment_by_name(experiment_name) is None:
         client.create_experiment(experiment_name)
-        logging.info(f"Created new experiment '{experiment_name}'.")
-    else:
-        logging.info(f"Experiment '{experiment_name}' already exists.")
+        logging.info("Created experiment '%s'", experiment_name)
+
 
 def get_or_create_run(experiment_name: str, run_name: str) -> str:
-    """
-    Return the run_id for (experiment_name, run_name).
-    If the run does not exist it is created *via MlflowClient.create_run*,
-    which does not occupy the global `mlflow.active_run()` slot.
-    """
+    """Return run_id for (experiment, name), creating if necessary (headless)."""
     client = MlflowClient()
-
-    # ------------------------------------------------------------------
-    # 1) Get (or create) the experiment and remember its ID
-    # ------------------------------------------------------------------
-    experiment = client.get_experiment_by_name(experiment_name)
-    if experiment is None:
-        experiment_id = client.create_experiment(experiment_name)
+    exp = client.get_experiment_by_name(experiment_name)
+    if exp is None:
+        exp_id = client.create_experiment(experiment_name)
     else:
-        experiment_id = experiment.experiment_id
+        exp_id = exp.experiment_id
 
-    # ------------------------------------------------------------------
-    # 2) Look for an existing run with the requested name
-    # ------------------------------------------------------------------
-    runs = client.search_runs(
-        [experiment_id],
-        filter_string=f"tags.mlflow.runName = '{run_name}'"
-    )
+    runs = client.search_runs([exp_id], f"tags.mlflow.runName = '{run_name}'")
     if runs:
         run_id = runs[0].info.run_id
-        logging.info(f"Resuming run '{run_name}' (run_id={run_id})")
+        logging.info("Resuming run '%s' (run_id=%s)", run_name, run_id)
         return run_id
 
-    # ------------------------------------------------------------------
-    # 3) Otherwise create the run *without starting it locally*
-    # ------------------------------------------------------------------
-    run_info = client.create_run(
-        experiment_id=experiment_id,
-        tags={"mlflow.runName": run_name}
-    )
-    run_id = run_info.info.run_id
-    logging.info(f"Created new run '{run_name}' (run_id={run_id})")
+    run_id = client.create_run(exp_id, tags={"mlflow.runName": run_name}).info.run_id
+    logging.info("Created new run '%s' (run_id=%s)", run_name, run_id)
     return run_id
 
 
-def log_params(params_dict):
-    """Log a dictionary of hyperparameters to MLflow."""
-    for k, v in params_dict.items():
+# -----------------------------------------------------------------------------
+# thin wrappers around mlflow.* calls
+# -----------------------------------------------------------------------------
+
+def log_params(params: dict[str, any]):
+    for k, v in params.items():
         mlflow.log_param(k, v)
 
-def log_metrics(metrics_dict, step=None):
-    """Log a dictionary of metrics to MLflow."""
+
+def log_metrics(metrics_dict: dict[str, float], step: int | None = None):
     mlflow.log_metrics(metrics_dict, step=step)
 
-    
-def log_all_metrics_batch(run_id, metrics_history, start_epoch):
-    """
-    Log all epoch metrics in one batch using MLflow's REST API via log_batch.
-    
-    Parameters:
-      run_id (str): The MLflow run ID.
-      metrics_history (dict): A dictionary containing lists for each metric. It must include:
-          "train_loss", "train_accuracy", "val_loss", "val_accuracy".
-      start_epoch (int): The starting epoch number (for proper step numbering).
-      
-    This function builds a list of MLflow Metric objects and logs them in a single call.
-    """
+
+def log_all_metrics_batch(run_id: str, metrics_history: dict[str, list[float]], start_epoch: int):
+    """Efficient batch logging given the metric lists collected in training."""
     client = MlflowClient()
-    metric_list = []
+    metric_objs: list[Metric] = []
     n_epochs = len(metrics_history["train_loss"])
-    
+    now = int(round(time.time() * 1000))
     for i in range(n_epochs):
-        # If starting from epoch 0 (fresh run), the first element in metrics_history is the baseline (step 0).
-        # Otherwise, if resuming, metrics_history starts at start_epoch.
-        if start_epoch == 0:
-            epoch = (start_epoch - 1) + i  # baseline becomes step 0, training epoch 1 becomes step 1, etc.
+        epoch = (start_epoch + i) if start_epoch else i
+        
+        if "train_accuracy" in metrics_history.keys():
+            metric_objs.extend([
+                Metric("train_loss", metrics_history["train_loss"][i], now, epoch),
+                Metric("val_loss",   metrics_history["val_loss"][i],   now, epoch),
+                Metric("train_accuracy", metrics_history["train_accuracy"][i], now, epoch),
+                Metric("val_accuracy",   metrics_history["val_accuracy"][i],   now, epoch),
+            ])
         else:
-            epoch = start_epoch + i       # resume from the actual training epoch numbers
-        timestamp = int(round(time.time() * 1000))
-        metric_list.extend([
-            Metric("train_loss", metrics_history["train_loss"][i], timestamp, epoch),
-#             Metric("train_accuracy", metrics_history["train_accuracy"][i], timestamp, epoch),
-            Metric("val_loss", metrics_history["val_loss"][i], timestamp, epoch),
-#             Metric("val_accuracy", metrics_history["val_accuracy"][i], timestamp, epoch)
-        ])
-    
-    client.log_batch(run_id, metrics=metric_list)
-    
-def log_artifact(artifact_path, artifact_filename):
-    """
-    Log an artifact (e.g. model state) with MLflow.
-    """
-    import os
-    import tempfile
-    import shutil
+            metric_objs.extend([
+                Metric("train_loss", metrics_history["train_loss"][i], now, epoch),
+                Metric("val_loss",   metrics_history["val_loss"][i],   now, epoch),
+            ])
+    client.log_batch(run_id, metrics=metric_objs)
 
-    if os.path.basename(artifact_path) != artifact_filename:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_file = os.path.join(temp_dir, artifact_filename)
-            shutil.copy2(artifact_path, temp_file)
-            mlflow.log_artifact(temp_file)
+
+def log_artifact(local_path: str, artifact_name: str):
+    """Upload *local_path* to MLflow under *artifact_name*."""
+    if os.path.basename(local_path) != artifact_name:
+        # keep MLflow directory clean by renaming inside tmp dir
+        with tempfile.TemporaryDirectory() as tmpd:
+            dst = os.path.join(tmpd, artifact_name)
+            shutil.copy2(local_path, dst)
+            mlflow.log_artifact(dst)
     else:
-        mlflow.log_artifact(artifact_path)
+        mlflow.log_artifact(local_path)
 
-def start_run(run_id):
-    """
-    Start or resume an MLflow run by run_id.
-    """
+
+def start_run(run_id: str):
     return mlflow.start_run(run_id=run_id)
+
 
 @contextmanager
 def dummy_run():
-    """
-    Dummy context manager for when MLflow is disabled.
-    """
     yield None

@@ -227,3 +227,234 @@ class QNN(nn.Module):
                           kernel_init=nn.initializers.normal(stddev=self.init_std)
                          )(circuit_out)
         return output
+    
+    
+    
+    
+# ===============================================================
+# Kingston-style noise model (medians, July 2025 dashboard)
+# ===============================================================
+
+import math
+import jax.numpy as jnp
+import numpy as np
+import tensorcircuit as tc
+
+# ─── Device-wide constants (all taken from your screenshot) ────
+T1_MEDIAN = 224.38e-6           # 224.38 µs  ⇒ 224.38×10⁻⁶ s
+T2_MEDIAN = 120.53e-6           # 120.53 µs
+EPC_1Q    = 2.335e-4            # median SX error  (used for *all* 1-q gates)
+EPC_2Q    = 2.137e-3            # median CZ error  (used for RZZ)
+
+# order-of-magnitude pulse lengths for Heron r2 processors
+GATE_DUR = {                    # seconds
+    "rx": 35e-9,                # 35 ns   (≈ sx length)
+    "rz": 0.0,                  # virtual Z (frame shift → no deco)
+    "sx": 35e-9,
+    "x" : 70e-9,
+    "rzz": 250e-9               # taken ~ CZ duration
+}
+
+# ---------------------------------------------------------------
+# Helper: thermal-relaxation γ’s for a *single* gate of duration t
+# ---------------------------------------------------------------
+def _relaxation_gammas(t):
+    """Return (γ_AD, γ_PD) for a gate that lasts `t` seconds."""
+    if t == 0.0:
+        return 0.0, 0.0
+    g_ad = 1.0 - math.exp(-t / T1_MEDIAN)   # amplitude damping
+    g_pd = 1.0 - math.exp(-t / T2_MEDIAN)   # phase damping
+    return g_ad, g_pd
+
+
+# ---------------------------------------------------------------
+# Noise after a *physical* gate
+# ---------------------------------------------------------------
+def apply_gate_noise(circ, qubits, gate_label):
+    """
+    Add depolarising + thermal-relaxation noise that corresponds to one
+    *physical* Kingston gate.
+    """
+    # 1) Depolarising channel
+    if gate_label == "rzz":
+        p = EPC_2Q
+    else:
+        p = EPC_1Q
+
+    for q in qubits:
+        circ.depolarizing(q, px=p/3, py=p/3, pz=p/3)
+
+    # 2) Thermal-relaxation channel
+    g_ad, g_pd = _relaxation_gammas(GATE_DUR.get(gate_label, 0.0))
+    if g_ad > 0 or g_pd > 0:
+        for q in qubits:
+            if g_ad > 0:
+                circ.amplitudedamping(q, gamma=g_ad, p=1.0)
+            if g_pd > 0:
+                circ.phasedamping(q, gamma=g_pd)
+
+
+# ---------------------------------------------------------------
+# Noise for an *idle* period of length t_wait (seconds)
+# ---------------------------------------------------------------
+def apply_idle_noise(circ, qubits, t_wait):
+    """Apply only thermal-relaxation noise (no depolarising) for idle time."""
+    if t_wait <= 0:
+        return
+    g_ad, g_pd = _relaxation_gammas(t_wait)
+    for q in qubits:
+        if g_ad > 0:
+            circ.amplitudedamping(q, gamma=g_ad, p=1.0)
+        if g_pd > 0:
+            circ.phasedamping(q, gamma=g_pd)
+
+
+# ===============================================================
+# Quantum circuit with Kingston native gates + realistic noise
+# ===============================================================
+def quantum_circuit_ibm(
+    x,
+    weights,
+    entanglement_weights,
+    final_rotations,
+    num_qubits,
+    layer_depth,
+    num_frequencies,
+    t_wait=0.0,                       # ❶ NEW hyper-parameter (seconds)
+):
+    """
+    • RXX → RZZ
+    • R(θ,φ,α) → Rz(φ) Rx(θ) Rz(α)      (all three get noise)
+    • After *every* physical gate → depol + relax
+    • After encoding Rx, after each full Rz-Rx-Rz block, and after each RZZ
+      → extra idle-time relaxation of length `t_wait`
+    """
+    c = tc.DMCircuit(num_qubits)      # density-matrix simulation
+
+    qubit_range = list(range(num_qubits))
+
+    for f in range(num_frequencies):
+
+        # ── Input encoding ───────────────────────────────────────
+        for q in qubit_range:
+            c.rx(q, theta=x[q])
+            apply_gate_noise(c, [q], "rx")
+        apply_idle_noise(c, qubit_range, t_wait)
+
+        # ── Variational layers ──────────────────────────────────
+        for k in range(layer_depth):
+
+            # ••• Local rotations •••
+            for q in qubit_range:
+                θ, φ, α = weights[f, k, q]
+
+                c.rz(q, theta=φ)
+                apply_gate_noise(c, [q], "rz")
+
+                c.rx(q, theta=θ)
+                apply_gate_noise(c, [q], "rx")
+
+                c.rz(q, theta=α)
+                apply_gate_noise(c, [q], "rz")
+
+            apply_idle_noise(c, qubit_range, t_wait)
+
+            # ••• Entangling ring of RZZs •••
+            for q in range(num_qubits - 1):
+                θ_ent = entanglement_weights[f, k, q]
+                c.rzz(q, q + 1, theta=θ_ent)
+                apply_gate_noise(c, [q, q + 1], "rzz")
+
+            apply_idle_noise(c, qubit_range, t_wait)
+
+    # ── Final rotation layer ────────────────────────────────────
+    for q in qubit_range:
+        θ, φ, α = final_rotations[q]
+
+        c.rz(q, theta=φ)
+        apply_gate_noise(c, [q], "rz")
+
+        c.rx(q, theta=θ)
+        apply_gate_noise(c, [q], "rx")
+
+        c.rz(q, theta=α)
+        apply_gate_noise(c, [q], "rz")
+
+    # Example: return ⟨Z₀⟩; extend as you like
+    out = [c.expectation_ps(z=[0])]
+#     out = [c.expectation_ps(z=[j]) for j in range(num_qubits)]
+    return jnp.real(jnp.array(out))
+
+
+class QNN_IBM(nn.Module):
+    num_features: int = 8         # classical input; num_qubits computed automatically
+    num_frequencies: int = 1      
+    layer_depth: int = 1          
+    num_output: int = 1
+    init_std: float = 0.1       # used in final dense layer
+    init_std_Q: float = 0.1       # used for quantum circuit weights
+    frequency_min_init: float = 1.0  
+    trainable_frequency_min: bool = True
+    t_wait: float = 0.0
+    
+    @property
+    def num_qubits(self):
+        # In this design, we assume one qubit per classical feature.
+        return self.num_features
+
+    @nn.compact
+    def __call__(self, x):
+        # x: shape (batch_size, num_qubits)
+        num_qubits = self.num_qubits
+        # Frequency scaling.
+        frequency_min = (
+            self.param("frequency_min", lambda rng: jnp.array(self.frequency_min_init, dtype=x.dtype))
+            if self.trainable_frequency_min else self.frequency_min_init
+        )
+        x_scaled = x * frequency_min
+
+        # Define shapes for the combined weights.
+        shape_weights = (self.num_frequencies, self.layer_depth, num_qubits, 3)
+        shape_entanglement = (self.num_frequencies, self.layer_depth, num_qubits - 1)
+        shape_final = (num_qubits, 3)
+
+        # Compute total sizes as Python integers.
+        size_weights = int(np.prod(shape_weights))
+        size_entanglement = int(np.prod(shape_entanglement))
+        size_final = int(np.prod(shape_final))
+        total_size = size_weights + size_entanglement + size_final
+
+        # Combined parameter for all quantum circuit weights.
+        quanum_weights = self.param(
+            "quanum_weights",
+            lambda rng, shape: jax.random.normal(rng, shape) * self.init_std_Q,
+            (total_size,)
+        )
+
+        # Slice and reshape to recover individual parameters.
+        weights = jnp.reshape(quanum_weights[:size_weights], shape_weights)
+        entanglement_weights = jnp.reshape(
+            quanum_weights[size_weights:size_weights + size_entanglement], shape_entanglement
+        )
+        final_rotations = jnp.reshape(
+            quanum_weights[size_weights + size_entanglement:], shape_final
+        )
+
+        # Build the quantum circuit output (vectorized over the batch).
+        circuit_out = jax.vmap(
+            lambda single_x: quantum_circuit_ibm(
+                single_x,
+                weights,
+                entanglement_weights,
+                final_rotations,
+                num_qubits,
+                self.layer_depth,
+                self.num_frequencies,
+                self.t_wait
+            )
+        )(x_scaled)
+        # Use a dense layer on the circuit output.
+        output = nn.Dense(self.num_output,
+                          kernel_init=nn.initializers.normal(stddev=self.init_std)
+                         )(circuit_out)
+        return output

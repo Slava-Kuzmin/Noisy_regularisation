@@ -1,282 +1,273 @@
-# experiments_run.py
-import os
-os.environ["JAX_PLATFORMS"] = "cpu"  # Use this variable instead of JAX_PLATFORM_NAME.
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMBA_NUM_THREADS"] = "1"
+"""
+Driver script for running (and resuming) JAX training experiments with
+Optuna + Celery orchestration.
 
-import tempfile
+**What changed**
+----------------
+1. When resuming a run we now download *best* checkpoint + metric.  
+2. The values are forwarded to `train_reg` / `train_cls`.  
+3. After training we log the updated best checkpoint + `best_val_loss` metric.
+"""
+
+from __future__ import annotations
+
+# -----------------------------------------------------------------------------
+# ––– system thread limitations (CPU‑only baseline) –––
+# -----------------------------------------------------------------------------
+import os
+os.environ.update({
+    "JAX_PLATFORMS": "cpu",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+    "NUMBA_NUM_THREADS": "1",
+})
+
+# -----------------------------------------------------------------------------
 import logging
-import math
+import tempfile
+from typing import Any, Dict, Tuple
+
 import jax
 import jax.numpy as jnp
-import optuna
-import mlflow  # ensure mlflow is imported
+import mlflow
 import numpy as np
+import optuna
+from celery import Celery
 
 from jax_training.mlflow_tracking import (
     initialize_experiment,
     get_or_create_run,
     start_run,
     log_params,
-    log_metrics,
+    log_all_metrics_batch,
     log_artifact,
     dummy_run,
-    log_all_metrics_batch
 )
-
 from jax_training.training_jax import (
-    create_train_state_cls,
-    train_cls,  # Assumes train_cls uses validation data.
+    create_train_state_reg,
+    train_reg,
     save_state_to_bytes,
     load_state_from_bytes,
     count_parameters,
-    train_reg,
-    create_train_state_reg
 )
-
-from jax_training.pca_datasets import generate_dataset_semeion_pca, generate_dataset_diabetes_pca
-
-# Import models from models_jax.py
+from jax_training.pca_datasets import generate_dataset_diabetes_pca, generate_dataset_semeion_pca, generate_dataset_wine_pca, generate_dataset_concrete_pca, generate_dataset_energy_pca, generate_dataset_synthetic, generate_dataset_airfoil
 from jax_training.models_jax import QNN
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-def generate_run_name(param_dict):
-    if isinstance(param_dict, dict):
-        # Sort the dictionary items and join key and value for each pair.
-        return "_".join(f"{key}{value}" for key, value in sorted(param_dict.items()))
-    else:
-        # If it's not a dictionary, assume it's already a run name string.
-        return str(param_dict)
+# -----------------------------------------------------------------------------
+# helpers
+# -----------------------------------------------------------------------------
 
-    
+def generate_run_name(param_dict: Dict[str, Any]) -> str:
+    return "_".join(f"{k}{v}" for k, v in sorted(param_dict.items()))
+
+# -----------------------------------------------------------------------------
+# core experiment launcher
+# -----------------------------------------------------------------------------
 
 def run_experiment(
-    param_dict,
-    target_epochs,
-    experiment_name="default_experiment",
-    db_path="sqlite:///experiments.db",
-    prune_callback=None,      
-    print_output=False,
-    use_mlflow=True,
-    smoothing=0.0,
-    test_size=0.,
-    val_size=0.15
+    param_dict: Dict[str, Any],
+    target_epochs: int,
+    *,
+    experiment_name: str = "default_experiment",
+    db_path: str = "sqlite:///experiments.db",
+    prune_callback=None,
+    print_output: bool = False,
+    use_mlflow: bool = True,
+    smoothing: float = 0.0,
+    test_size: float = 0.0,
+    val_size: float = 0.15,
 ):
-    print(param_dict)
-    # Generate a run name directly from the parameter dictionary.
     run_name = generate_run_name(param_dict)
-    logging.info(f"Starting experiment with run name: {run_name}")
-    
-    # Initialize MLflow run context or dummy context.
+    logging.info("Starting experiment '%s'", run_name)
+
+    # ---- 1) open MLflow context ------------------------------------------------
     if use_mlflow:
-        logging.info("Initializing MLflow experiment tracking...")
-        initialize_experiment(experiment_name, db_path=db_path)
+        initialize_experiment(experiment_name, db_path)
         run_id = get_or_create_run(experiment_name, run_name)
-        run_context = start_run(run_id)
+        run_ctx = start_run(run_id)
     else:
-        logging.info("Running without MLflow tracking.")
-        run_context = dummy_run()
-    
-    # Attempt to resume previous run if available.
+        run_ctx = dummy_run()
+
+    # ---- 2) check for previous run state --------------------------------------
     start_epoch = 0
-    state = None
+    params = opt_state = None
+    best_state_blob_prev = None
+    best_val_loss_prev = None
+    best_epoch_prev = None
+
     if use_mlflow:
         try:
-            from mlflow.tracking import MlflowClient
-            client = MlflowClient()
+            client = mlflow.tracking.MlflowClient()
             existing_run = client.get_run(run_id)
             if existing_run and existing_run.info.lifecycle_stage == "active":
-                logging.info(f"Found existing run: {run_name} with run_id={run_id}")
-                artifact_uri = f"model_state_{run_name}.pkl"
-                local_path = None
+                # last‑epoch model -------------------------------------------------
                 try:
-                    local_path = mlflow.artifacts.download_artifacts(
-                        artifact_path=artifact_uri, run_id=run_id
+                    art_path = mlflow.artifacts.download_artifacts(
+                        artifact_path=f"model_state_{run_name}.pkl", run_id=run_id
                     )
+                    with open(art_path, "rb") as fh:
+                        params, opt_state = load_state_from_bytes(fh.read())
                 except Exception as e:
-                    logging.warning(f"No artifact found; starting fresh. {e}")
-                if local_path:
-                    with open(local_path, "rb") as f:
-                        params, opt_state = load_state_from_bytes(f.read())
-                        
-                    metrics = client.get_metric_history(run_id, "train_loss")
-                    if metrics:
-                        last_epoch = max(metric.step for metric in metrics)
-                        start_epoch = last_epoch + 1
-                        logging.info(f"Resuming training from epoch {start_epoch}.")
-                        if start_epoch >= target_epochs:
-                            logging.info("Target epochs already reached; skipping training.")
-                            return {}  # Or return current metrics
-                    else:
-                        logging.warning("No metrics found; starting from scratch.")
-        except Exception as e:
-            logging.warning(f"Failed to resume previous run; starting fresh. Error: {e}")
-            
-    print("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$")
-    print([start_epoch, target_epochs])
-    print("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$")
-    if start_epoch >= target_epochs or target_epochs <= 0:
-        metrics_history = {
-            "train_loss": [],
-#             "train_accuracy": [],
-            "val_loss": [],
-#             "val_accuracy": []
-        }
-        return metrics_history
+                    logging.info("No last‑epoch checkpoint yet: %s", e)
 
-    # Create new state.
-    rng = jax.random.PRNGKey(0)
-    model_type = param_dict["model_type"]
+                # best checkpoint -------------------------------------------------
+                try:
+                    best_art_path = mlflow.artifacts.download_artifacts(
+                        artifact_path=f"best_model_state_{run_name}.pkl", run_id=run_id
+                    )
+                    with open(best_art_path, "rb") as fh:
+                        best_state_blob_prev = fh.read()
+                except Exception:
+                    pass  # not logged yet
+
+                # resume epoch number -------------------------------------------
+                tl_hist = client.get_metric_history(run_id, "train_loss")
+                if tl_hist:
+                    start_epoch = max(m.step for m in tl_hist) + 1
+
+                # best metric history ------------------------------------------
+                bl_hist = client.get_metric_history(run_id, "best_val_loss")
+                if bl_hist:
+                    best_val_loss_prev = bl_hist[-1].value
+                    best_epoch_prev = bl_hist[-1].step
+
+                if start_epoch >= target_epochs:
+                    logging.info("Target epochs reached previously – nothing to do.")
+                    return {}
+        except Exception as e:
+            logging.warning("Resume check failed: %s", e)
+
+    # ---- 3) build model + initial TrainState ----------------------------------
+    rng = jax.random.PRNGKey(param_dict["ind_trajectory"])
     num_features = param_dict["num_features"]
-    # Determine dummy_x based on the model.
     dummy_x = jnp.ones((1, num_features))
-    
-    # Build model based on model_type.
-#     if model_type == "FNN":
-#         model = FNN(num_features=num_features, num_frequencies=param_dict["num_frequencies"],
-#                     num_output=10, init_std=param_dict["init_std"],
-#                     frequency_min_init=1.0, trainable_frequency_min=True)
-#     elif model_type == "QNN":
-#         model = QNN(num_features=num_features, num_frequencies=param_dict["num_frequencies"],
-#                     layer_depth=param_dict["layer_depth"], num_output=10, init_std=param_dict["init_std"],
-#                     frequency_min_init=1.0, trainable_frequency_min=True)
-#     elif model_type == "AENN":
-#         model = AENN(num_features=num_features, layer_depth=param_dict["layer_depth"],
-#                      num_output=10, init_std=param_dict["init_std"])
-#     elif model_type == "SquareLinearModel":
-#         model = SquareLinearModel(num_features=num_features, num_output=10, init_std=param_dict["init_std"])
-#     elif model_type == "MPS_FNN":
-#         model = MPS_FNN(num_features=num_features, bond_dim=param_dict["bond_dim"],
-#                         num_frequencies=param_dict["num_frequencies"], num_output=10,
-#                         init_std=param_dict["init_std"], frequency_min_init=1.0,
-#                         trainable_frequency_min=True)
-#     elif model_type == "LinearModel":
-#         model = LinearModel(num_output=10)
-    
+
     model = QNN(
-        num_features=num_features, 
+        num_features=num_features,
         num_frequencies=param_dict["num_frequencies"],
-        layer_depth=param_dict["layer_depth"], 
-        num_output=1, 
+        layer_depth=param_dict["layer_depth"],
+        num_output=1,
         init_std=param_dict["init_std"],
         init_std_Q=param_dict["init_std_Q"],
-        frequency_min_init=2.0*np.pi, 
-        trainable_frequency_min=False, 
-        ad=param_dict["ad"], 
-        pd=param_dict["pd"], 
-        dp=param_dict["dp"])
-        
-    state = create_train_state_reg(module=model, rng=rng, learning_rate=param_dict["learning_rate"],
-                                   weight_decay=param_dict["weight_decay"], x_item=dummy_x)
-    
-    if start_epoch > 0:
+        frequency_min_init=2.0 * np.pi,
+        trainable_frequency_min=False,
+        ad=param_dict["ad"],
+        pd=param_dict["pd"],
+        dp=param_dict["dp"],
+    )
+
+    state = create_train_state_reg(
+        module=model,
+        rng=rng,
+        learning_rate=param_dict["learning_rate"],
+        weight_decay=param_dict["weight_decay"],
+        x_item=dummy_x,
+    )
+    if params is not None:
         state = state.replace(params=params, opt_state=opt_state)
-    
-    # Prepare dataset.
-#     X_train, y_train, X_val, y_val, X_test, y_test = generate_dataset_semeion_pca(
-#         n_components=num_features,
-#         test_size=test_size,
-#         val_size=val_size,
-#         random_state=param_dict["ind_trajectory"]
-#     )
-    
-    X_train, y_train, X_val, y_val, X_test, y_test = generate_dataset_diabetes_pca(
+
+    # ---- 4) dataset ------------------------------------------------------------
+    X_tr, y_tr, X_val, y_val, X_test, y_test = generate_dataset_concrete_pca(
         n_components=num_features,
         test_size=test_size,
         val_size=val_size,
-#         random_state=param_dict["ind_trajectory"]
-        random_state = 0
+        random_state=0,
     )
-    
-    # Log hyperparameters. Use param_dict directly plus add "num_parameters".
+
+    # ---- 5) log hyperparams on fresh run --------------------------------------
     if use_mlflow and start_epoch == 0:
-        num_params = count_parameters(state.params)
-        param_dict["num_parameters"] = num_params
+        param_dict["num_parameters"] = count_parameters(state.params)
         log_params(param_dict)
-    
-    logging.info("Starting training...")
-    with run_context:
-        state, metrics_history = train_reg(
+
+    # ---- 6) training -----------------------------------------------------------
+    logging.info("Begin training from epoch %d", start_epoch)
+    with run_ctx:
+        (
+            state,
+            metrics_hist,
+            best_state_blob,
+            best_val_loss,
+            best_epoch,
+        ) = train_reg(
             state=state,
-            X_train=X_train,
-            y_train=y_train,
+            X_train=X_tr,
+            y_train=y_tr,
             X_val=X_val,
             y_val=y_val,
             batch_size=param_dict["batch_size"],
             target_epochs=target_epochs,
             start_epoch=start_epoch,
-#             smoothing=smoothing,
             print_output=print_output,
-#             prune_callback=prune_callback
+            initial_best_state_blob=best_state_blob_prev,
+            initial_best_val_loss=best_val_loss_prev,
+            initial_best_epoch=best_epoch_prev,
         )
 
         if use_mlflow:
-            log_all_metrics_batch(run_id, metrics_history, start_epoch)
-            
-#         if use_mlflow:
-#             for epoch in range(start_epoch, target_epochs + 1):
-#                 log_metrics({
-#                     "train_loss": metrics_history["train_loss"][epoch - start_epoch],
-#                     "train_accuracy": metrics_history["train_accuracy"][epoch - start_epoch],
-#                     "val_loss": metrics_history["val_loss"][epoch - start_epoch],
-#                     "val_accuracy": metrics_history["val_accuracy"][epoch - start_epoch],
-#                 }, step=epoch)
-                
-        if use_mlflow:
-            logging.info("Saving final model state...")
-            byte_data = save_state_to_bytes(state.params, state.opt_state)
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as temp_file:
-                temp_file.write(byte_data)
-                artifact_path = temp_file.name
-            artifact_filename = f"model_state_{run_name}.pkl"
-            log_artifact(artifact_path, artifact_filename)
-            os.remove(artifact_path)
-            logging.info(f"Experiment completed and logged to MLflow: {run_name}")
-        else:
-            logging.info("Experiment completed without MLflow logging.")
+            # metrics (all epochs) ------------------------------------
+            log_all_metrics_batch(run_id, metrics_hist, start_epoch)
 
-    return metrics_history
+            # last‑epoch model ---------------------------------------
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pkl")
+            tmp.write(save_state_to_bytes(state.params, state.opt_state))
+            tmp.close()
+            log_artifact(tmp.name, f"model_state_{run_name}.pkl")
+            os.remove(tmp.name)
+
+            # best checkpoint + metric -------------------------------
+            if best_state_blob is not None:
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pkl")
+                tmp.write(best_state_blob)
+                tmp.close()
+                log_artifact(tmp.name, f"best_model_state_{run_name}.pkl")
+                os.remove(tmp.name)
+                mlflow.log_metric("best_val_loss", best_val_loss, step=best_epoch)
+                mlflow.set_tag("best_epoch", best_epoch)
+
+            logging.info("Run '%s' complete (run_id=%s)", run_name, run_id)
+
+    return metrics_hist
+
+# -----------------------------------------------------------------------------
+# Optuna / Celery wrappers (unchanged except import path fixes)
+# -----------------------------------------------------------------------------
 
 
 def worker(args):
     run_experiment(*args)
     return None
 
+
 def optimize_in_process(objective, storage, study_name, n_trials):
-    """
-    Run optimization using Optuna in-process.
-    """
     study = optuna.load_study(study_name=study_name, storage=storage)
     study.optimize(objective, n_trials=n_trials)
-    
-    
-    
-import json
-from celery import Celery
 
-# broker_url = 'redis://172.17.0.3:6379/0'  # Replace with your Machine 1 IP
-broker_url = 'redis://127.0.0.1:6379/0'  # Replace with your Machine 1 IP
-app = Celery('experiments_run', broker=broker_url, backend=broker_url)
+# Celery task ------------------------------------------------------
+
+broker_url = "redis://127.0.0.1:6379/0"
+app = Celery("experiments_run", broker=broker_url, backend=broker_url)
 
 
 @app.task
-def run_experiment_task(param_dict, target_epochs, db_path, prune_callback,
-                        print_output, use_mlflow, smoothing,
-                        test_size, val_size, experiment_name):
-    """
-    Celery task wrapper around `run_experiment`.
-    Ensures that *any* MLflow run opened by this worker is closed,
-    even if an exception occurs.
-    """
-    import mlflow  # local import keeps the top of the module lightweight
-
+def run_experiment_task(
+    param_dict,
+    target_epochs,
+    db_path,
+    prune_callback,
+    print_output,
+    use_mlflow,
+    smoothing,
+    test_size,
+    val_size,
+    experiment_name,
+):
     try:
-        logging.info("Starting run_experiment_task with parameters: %s", param_dict)
+        logging.info("Celery task starting: %s", param_dict)
         return run_experiment(
             param_dict,
             target_epochs=target_epochs,
@@ -287,15 +278,11 @@ def run_experiment_task(param_dict, target_epochs, db_path, prune_callback,
             use_mlflow=use_mlflow,
             smoothing=smoothing,
             test_size=test_size,
-            val_size=val_size
+            val_size=val_size,
         )
     except Exception as exc:
-        logging.error("Error in run_experiment_task: %s", exc)
+        logging.error("Task failed: %s", exc)
         raise
     finally:
-        # ------------------------------------------------------------------
-        # Good-practice clean-up: close any dangling active run.
-        # This prevents the “Run ... is already active” error on the next task.
-        # ------------------------------------------------------------------
-        if mlflow.active_run() is not None:
+        if mlflow.active_run():
             mlflow.end_run()
