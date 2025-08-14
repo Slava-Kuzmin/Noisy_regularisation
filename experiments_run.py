@@ -74,7 +74,7 @@ def run_experiment(
     target_epochs: int,
     *,
     experiment_name: str = "default_experiment",
-    db_path: str = "sqlite:///experiments.db",
+    db_path: str = "sqlite:///mlflow.db",
     prune_callback=None,
     print_output: bool = False,
     use_mlflow: bool = True,

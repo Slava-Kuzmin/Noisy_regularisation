@@ -12,6 +12,7 @@ import shutil
 import tempfile
 import time
 from contextlib import contextmanager
+import sqlite3
 
 import mlflow
 from mlflow.entities import Metric
@@ -24,8 +25,22 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 # -----------------------------------------------------------------------------
 
 def initialize_experiment(experiment_name: str, db_path: str = "sqlite:///mlflow.db"):
-    """Create experiment if it doesn't exist and set tracking URI."""
+    """Create experiment if it doesn't exist and set tracking URI.
+
+    For SQLite URIs, we also enable WAL journaling at the file level once,
+    which improves concurrent writer behavior with multiprocessing.
+    """
     mlflow.set_tracking_uri(db_path)
+
+    # If using a local SQLite file, enable WAL mode (persists at DB level)
+    if db_path.startswith("sqlite:///") and not db_path.startswith("sqlite:////"):  # three slashes => relative/working dir
+        db_file = db_path.replace("sqlite:///", "", 1)
+        try:
+            with sqlite3.connect(db_file) as conn:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA synchronous=NORMAL;")
+        except Exception as e:
+            logging.warning("Could not apply WAL mode to SQLite DB '%s': %s", db_file, e)
     client = MlflowClient()
     if client.get_experiment_by_name(experiment_name) is None:
         client.create_experiment(experiment_name)

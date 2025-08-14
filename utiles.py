@@ -1,7 +1,8 @@
 import os
 from itertools import product
 import numpy as np
-from experiments_run import run_experiment_task
+import multiprocessing as mp
+from experiments_run import run_experiment
 
 # ---------------------------
 # Main: parallel_experiments
@@ -37,19 +38,36 @@ def parallel_experiments(
             task_param_dict["ind_trajectory"] = traj
             tasks.append(task_param_dict)
 
-    # Submit each task asynchronously using Celery
-    futures = []
+    # Submit each task asynchronously using multiprocessing
+    # Use cpu_count by default; allow override via ENV `NR_PROC`
+    num_proc = int(os.environ.get("NR_PROC", mp.cpu_count()))
+    pool = mp.Pool(processes=num_proc, maxtasksperchild=1)
+
+    results = []
     for param_dict in tasks:
-        future = run_experiment_task.delay(
-            param_dict, target_epochs, db_path, prune_callback,
-            print_output, use_mlflow, smoothing, test_size, val_size, experiment_name
+        res = pool.apply_async(
+            run_experiment,
+            args=(param_dict, target_epochs),
+            kwds=dict(
+                experiment_name=experiment_name,
+                db_path=db_path,
+                prune_callback=prune_callback,
+                print_output=print_output,
+                use_mlflow=use_mlflow,
+                smoothing=smoothing,
+                test_size=test_size,
+                val_size=val_size,
+            ),
         )
-        futures.append(future)
+        results.append(res)
 
-    return futures
+    # Optionally, do not close the pool here if caller may submit more
+    pool.close()
+    # Caller can still .get() on ApplyResult objects
+    return results
 
 
-from experiments_IBM_run import run_experiment_task_IBM
+from experiments_IBM_run import run_experiment_IBM
 # ---------------------------
 def parallel_experiments_IBM(
     args,                    # Dictionary of hyperparameters
@@ -82,16 +100,30 @@ def parallel_experiments_IBM(
             task_param_dict["ind_trajectory"] = traj
             tasks.append(task_param_dict)
 
-    # Submit each task asynchronously using Celery
-    futures = []
-    for param_dict in tasks:
-        future = run_experiment_task_IBM.delay(
-            param_dict, target_epochs, db_path, prune_callback,
-            print_output, use_mlflow, smoothing, test_size, val_size, experiment_name
-        )
-        futures.append(future)
+    # Submit each task asynchronously using multiprocessing
+    num_proc = int(os.environ.get("NR_PROC", mp.cpu_count()))
+    pool = mp.Pool(processes=num_proc, maxtasksperchild=1)
 
-    return futures
+    results = []
+    for param_dict in tasks:
+        res = pool.apply_async(
+            run_experiment_IBM,
+            args=(param_dict, target_epochs),
+            kwds=dict(
+                experiment_name=experiment_name,
+                db_path=db_path,
+                prune_callback=prune_callback,
+                print_output=print_output,
+                use_mlflow=use_mlflow,
+                smoothing=smoothing,
+                test_size=test_size,
+                val_size=val_size,
+            ),
+        )
+        results.append(res)
+
+    pool.close()
+    return results
 
 import pandas as pd
 import numpy as np
