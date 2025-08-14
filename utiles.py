@@ -18,7 +18,9 @@ def parallel_experiments(
     smoothing,               # Float: smoothing for classification loss
     test_size,               # Float: test split ratio
     val_size,                # Float: validation split ratio
-    experiment_name          # String: name for the MLflow experiment
+    experiment_name,         # String: name for the MLflow experiment
+    *,
+    num_proc: int | None = None,
 ):
     """
     Runs experiments in parallel using Celery for the Cartesian product of hyperparameters
@@ -39,9 +41,11 @@ def parallel_experiments(
             tasks.append(task_param_dict)
 
     # Submit each task asynchronously using multiprocessing
-    # Use cpu_count by default; allow override via ENV `NR_PROC`
-    num_proc = int(os.environ.get("NR_PROC", mp.cpu_count()))
-    pool = mp.Pool(processes=num_proc, maxtasksperchild=1)
+    # Explicit num_proc overrides env; fallback to cpu_count()
+    if num_proc is None:
+        num_proc = int(os.environ.get("NR_PROC", mp.cpu_count()))
+    ctx = mp.get_context("spawn")
+    pool = ctx.Pool(processes=num_proc, maxtasksperchild=1)
 
     results = []
     for param_dict in tasks:
@@ -80,7 +84,9 @@ def parallel_experiments_IBM(
     smoothing,               # Float: smoothing for classification loss
     test_size,               # Float: test split ratio
     val_size,                # Float: validation split ratio
-    experiment_name          # String: name for the MLflow experiment
+    experiment_name,         # String: name for the MLflow experiment
+    *,
+    num_proc: int | None = None,
 ):
     """
     Runs experiments in parallel using Celery for the Cartesian product of hyperparameters
@@ -101,8 +107,10 @@ def parallel_experiments_IBM(
             tasks.append(task_param_dict)
 
     # Submit each task asynchronously using multiprocessing
-    num_proc = int(os.environ.get("NR_PROC", mp.cpu_count()))
-    pool = mp.Pool(processes=num_proc, maxtasksperchild=1)
+    if num_proc is None:
+        num_proc = int(os.environ.get("NR_PROC", mp.cpu_count()))
+    ctx = mp.get_context("spawn")
+    pool = ctx.Pool(processes=num_proc, maxtasksperchild=1)
 
     results = []
     for param_dict in tasks:
@@ -224,6 +232,8 @@ def parallel_experiments_tracked(
     test_size,
     val_size,
     experiment_name,
+    *,
+    num_proc: int | None = None,
 ):
     """
     Like parallel_experiments() but returns:
@@ -247,9 +257,11 @@ def parallel_experiments_tracked(
             d["ind_trajectory"] = traj
             task_param_dicts.append(d)
 
-    num_proc = int(os.environ.get("NR_PROC", mp.cpu_count()))
-    pool = mp.Pool(processes=num_proc, maxtasksperchild=1)
-    manager = mp.Manager()
+    if num_proc is None:
+        num_proc = int(os.environ.get("NR_PROC", mp.cpu_count()))
+    ctx = mp.get_context("spawn")
+    pool = ctx.Pool(processes=num_proc, maxtasksperchild=1)
+    manager = ctx.Manager()
     status = manager.dict()
 
     tasks_info = []
