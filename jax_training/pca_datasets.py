@@ -281,12 +281,17 @@ def generate_dataset_diabetes_pca(
         n_components: int = 8,
         test_size: float = 0.2,
         val_size: float = 0.2,
-        random_state: int = 42
+        random_state: int = 42,
+        noise_std_features: float = 0.0,
+        noise_std_targets: float = 0.0
     ):
     """
     Loads the Diabetes dataset, applies PCA to reduce it to n_components,
-    scales *both* the PCA features **and the targets** to [0, 1], and splits
-    the data into training, validation, and test sets.
+    scales *both* the PCA features **and the targets**, and splits the data 
+    into training, validation, and test sets. Adds optional Gaussian noise.
+
+    noise_std_features: std dev of Gaussian noise added to features after scaling
+    noise_std_targets:  std dev of Gaussian noise added to targets after scaling
     """
     # ------------------------------------------------------------------
     # 1. Load the dataset
@@ -339,8 +344,17 @@ def generate_dataset_diabetes_pca(
     X_val_scaled   = x_scaler.transform(X_val_pca)  if X_val_pca.shape[0]  > 0 else X_val_pca
     X_test_scaled  = x_scaler.transform(X_test_pca) if X_test_pca.shape[0] > 0 else X_test_pca
 
+    # Add noise to features if requested
+    if noise_std_features > 0:
+        rng = np.random.default_rng(random_state)
+        X_train_scaled += rng.normal(0, noise_std_features, X_train_scaled.shape)
+        if X_val_scaled.shape[0] > 0:
+            X_val_scaled += rng.normal(0, noise_std_features, X_val_scaled.shape)
+        if X_test_scaled.shape[0] > 0:
+            X_test_scaled += rng.normal(0, noise_std_features, X_test_scaled.shape)
+
     # ------------------------------------------------------------------
-    # 5b. **Scale targets to [0, 1]**
+    # 5b. Scale targets to [-1, 1]
     # ------------------------------------------------------------------
     y_scaler = MinMaxScaler(feature_range=(-1, 1))
     y_train_scaled = y_scaler.fit_transform(y_train.reshape(-1, 1)).ravel()
@@ -352,6 +366,15 @@ def generate_dataset_diabetes_pca(
         y_scaler.transform(y_test.reshape(-1, 1)).ravel()
         if y_test.shape[0] > 0 else y_test
     )
+
+    # Add noise to targets if requested
+    if noise_std_targets > 0:
+        rng = np.random.default_rng(random_state + 1)
+        y_train_scaled += rng.normal(0, noise_std_targets, y_train_scaled.shape)
+        if y_val_scaled.shape[0] > 0:
+            y_val_scaled += rng.normal(0, noise_std_targets, y_val_scaled.shape)
+        if y_test_scaled.shape[0] > 0:
+            y_test_scaled += rng.normal(0, noise_std_targets, y_test_scaled.shape)
 
     # ------------------------------------------------------------------
     # 6. Convert to JAX arrays and return
@@ -365,13 +388,6 @@ def generate_dataset_diabetes_pca(
         jnp.array(y_test_scaled,  dtype=jnp.float32),
     )
 
-
-import numpy as np
-import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import MinMaxScaler
-import jax.numpy as jnp
 
 def generate_dataset_wine_pca(
         n_components: int = 8,

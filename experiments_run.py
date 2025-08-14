@@ -172,12 +172,22 @@ def run_experiment(
         state = state.replace(params=params, opt_state=opt_state)
 
     # ---- 4) dataset ------------------------------------------------------------
-    X_tr, y_tr, X_val, y_val, X_test, y_test = generate_dataset_concrete_pca(
-        n_components=num_features,
-        test_size=test_size,
-        val_size=val_size,
-        random_state=0,
-    )
+#     X_tr, y_tr, X_val, y_val, X_test, y_test = generate_dataset_concrete_pca(
+#         n_components=num_features,
+#         test_size=test_size,
+#         val_size=val_size,
+#         random_state=0,
+#     )
+    
+    noise_std = param_dict["noise_std"]
+    X_tr, y_tr, X_val, y_val, X_test, y_test = generate_dataset_diabetes_pca(
+            n_components=num_features,
+            test_size=test_size,
+            val_size=val_size,
+            random_state=0,
+            noise_std_features = noise_std,
+            noise_std_targets = noise_std
+        )
 
     # ---- 5) log hyperparams on fresh run --------------------------------------
     if use_mlflow and start_epoch == 0:
@@ -249,7 +259,8 @@ def optimize_in_process(objective, storage, study_name, n_trials):
 
 # Celery task ------------------------------------------------------
 
-broker_url = "redis://127.0.0.1:6379/0"
+# broker_url = "redis://127.0.0.1:6379/0"
+broker_url = "redis://172.21.0.2:6379/0"
 app = Celery("experiments_run", broker=broker_url, backend=broker_url)
 
 
