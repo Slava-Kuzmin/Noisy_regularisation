@@ -1,1 +1,7 @@
 mlruns/
+
+# Local SQLite files
+simulation_results.db
+simulation_results.db-shm
+simulation_results.db-wal
+simulation_results.db.mlflow_init.lock
