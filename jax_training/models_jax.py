@@ -2,6 +2,16 @@ import math
 import string
 import jax
 import jax.numpy as jnp
+import numpy as _np
+
+# ------------------------------------------------------------------
+# NumPy ≥ 2.0 compatibility shim for libraries referencing ComplexWarning
+# ------------------------------------------------------------------
+if not hasattr(_np, "ComplexWarning"):
+    class _ComplexWarning(Warning):
+        pass
+    _np.ComplexWarning = _ComplexWarning  # type: ignore[attr-defined]
+
 import tensorcircuit as tc
 from flax import linen as nn
 

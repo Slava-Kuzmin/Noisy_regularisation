@@ -125,6 +125,190 @@ def parallel_experiments_IBM(
     pool.close()
     return results
 
+
+# -----------------------------------------------------------
+# Utility: summarize futures status (mp.Pool or Celery)
+# -----------------------------------------------------------
+def summarize_futures(futures):
+    """
+    Summarize a collection of asynchronous job handles.
+
+    Supports both:
+      - multiprocessing.pool.ApplyResult (from mp.Pool.apply_async)
+      - Celery AsyncResult (state in {PENDING, STARTED, SUCCESS, FAILURE, ...})
+
+    Returns a dict with counts:
+      {"succeeded": int, "failed": int, "running": int, "waiting": int}
+
+    Notes for multiprocessing futures:
+      • The standard ApplyResult API doesn't expose a RUNNING vs QUEUED distinction.
+        For these futures, all not-ready tasks are counted as "waiting".
+    """
+    counts = {"succeeded": 0, "failed": 0, "running": 0, "waiting": 0}
+
+    for fut in futures:
+        # --- Celery AsyncResult path (has 'state' attribute) ---
+        state = None
+        try:
+            state = getattr(fut, "state", None)
+        except Exception:
+            state = None
+
+        if isinstance(state, str):
+            s = state.upper()
+            if s == "SUCCESS":
+                counts["succeeded"] += 1
+            elif s in ("FAILURE", "REVOKED"):
+                counts["failed"] += 1
+            elif s in ("STARTED", "RETRY"):
+                counts["running"] += 1
+            elif s in ("PENDING",):
+                counts["waiting"] += 1
+            else:
+                counts["waiting"] += 1
+            continue
+
+        # --- multiprocessing ApplyResult path ---
+        if hasattr(fut, "ready") and callable(getattr(fut, "ready")):
+            try:
+                if fut.ready():
+                    # Completed: check if success
+                    try:
+                        if fut.successful():
+                            counts["succeeded"] += 1
+                        else:
+                            counts["failed"] += 1
+                    except Exception:
+                        # As a fallback, attempt a non-blocking get
+                        try:
+                            fut.get(timeout=0)
+                            counts["succeeded"] += 1
+                        except Exception:
+                            counts["failed"] += 1
+                else:
+                    # Not ready → queued or running; we count as waiting for mp
+                    counts["waiting"] += 1
+            except Exception:
+                counts["failed"] += 1
+            continue
+
+        # --- Unknown future type ---
+        counts["waiting"] += 1
+
+    return counts
+
+
+# -----------------------------------------------------------
+# Tracked submission helpers (distinguish running vs waiting)
+# -----------------------------------------------------------
+def _run_with_status(fn, status_dict, key, *args, **kwargs):
+    try:
+        status_dict[key] = "running"
+        result = fn(*args, **kwargs)
+        status_dict[key] = "succeeded"
+        return result
+    except Exception:
+        status_dict[key] = "failed"
+        raise
+
+
+def parallel_experiments_tracked(
+    args,
+    target_epochs,
+    n_trajectories,
+    db_path,
+    prune_callback,
+    print_output,
+    use_mlflow,
+    smoothing,
+    test_size,
+    val_size,
+    experiment_name,
+):
+    """
+    Like parallel_experiments() but returns:
+      - tasks_info: list of {"id": key, "future": ApplyResult}
+      - status: multiprocessing.Manager().dict mapping key -> status
+
+    Status values: 'waiting' | 'running' | 'succeeded' | 'failed'
+    """
+    keys = list(args.keys())
+    values_list = [
+        list(args[k]) if isinstance(args[k], (list, tuple, np.ndarray)) else [args[k]]
+        for k in keys
+    ]
+
+    # enumerate all param_dicts
+    task_param_dicts = []
+    for combination in product(*values_list):
+        base_param_dict = {k: v for k, v in zip(keys, combination)}
+        for traj in range(n_trajectories):
+            d = base_param_dict.copy()
+            d["ind_trajectory"] = traj
+            task_param_dicts.append(d)
+
+    num_proc = int(os.environ.get("NR_PROC", mp.cpu_count()))
+    pool = mp.Pool(processes=num_proc, maxtasksperchild=1)
+    manager = mp.Manager()
+    status = manager.dict()
+
+    tasks_info = []
+    for idx, param_dict in enumerate(task_param_dicts):
+        # Construct a stable id for tracking
+        try:
+            base = "_".join(f"{k}{param_dict[k]}" for k in sorted(param_dict.keys()))
+        except Exception:
+            base = f"task{idx}"
+        key = f"{experiment_name}__{base}__{idx}"
+        status[key] = "waiting"
+
+        fut = pool.apply_async(
+            _run_with_status,
+            args=(run_experiment, status, key, param_dict, target_epochs),
+            kwds=dict(
+                experiment_name=experiment_name,
+                db_path=db_path,
+                prune_callback=prune_callback,
+                print_output=print_output,
+                use_mlflow=use_mlflow,
+                smoothing=smoothing,
+                test_size=test_size,
+                val_size=val_size,
+            ),
+        )
+        tasks_info.append({"id": key, "future": fut})
+
+    pool.close()
+    return tasks_info, status
+
+
+def summarize_tracked(tasks_info, status):
+    """
+    Summarize status using tracked submissions.
+
+    tasks_info: list of {"id": key, "future": ApplyResult}
+    status: Manager().dict mapping key -> status
+    """
+    counts = {"succeeded": 0, "failed": 0, "running": 0, "waiting": 0}
+    for item in tasks_info:
+        key = item["id"]
+        fut = item["future"]
+        st = status.get(key, "waiting")
+        if fut.ready():
+            try:
+                if fut.successful():
+                    counts["succeeded"] += 1
+                else:
+                    counts["failed"] += 1
+            except Exception:
+                counts["failed"] += 1
+        else:
+            if st == "running":
+                counts["running"] += 1
+            else:
+                counts["waiting"] += 1
+    return counts
+
 import pandas as pd
 import numpy as np
 import math

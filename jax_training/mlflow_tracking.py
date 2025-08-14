@@ -13,6 +13,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 import sqlite3
+import fcntl
 
 import mlflow
 from mlflow.entities import Metric
@@ -27,24 +28,56 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 def initialize_experiment(experiment_name: str, db_path: str = "sqlite:///mlflow.db"):
     """Create experiment if it doesn't exist and set tracking URI.
 
-    For SQLite URIs, we also enable WAL journaling at the file level once,
-    which improves concurrent writer behavior with multiprocessing.
+    For SQLite URIs, serialize the initial Alembic migration using a file lock
+    and enable WAL journaling to reduce write contention under multiprocessing.
     """
-    mlflow.set_tracking_uri(db_path)
-
-    # If using a local SQLite file, enable WAL mode (persists at DB level)
-    if db_path.startswith("sqlite:///") and not db_path.startswith("sqlite:////"):  # three slashes => relative/working dir
+    # Determine local SQLite file path (supports sqlite:///rel and sqlite:////abs)
+    db_file = None
+    if db_path.startswith("sqlite:////"):
+        db_file = db_path.replace("sqlite:////", "", 1)
+        if not db_file.startswith("/"):
+            db_file = "/" + db_file
+    elif db_path.startswith("sqlite:///"):
         db_file = db_path.replace("sqlite:///", "", 1)
+
+    if db_file:
+        # Ensure directory exists
         try:
-            with sqlite3.connect(db_file) as conn:
-                conn.execute("PRAGMA journal_mode=WAL;")
-                conn.execute("PRAGMA synchronous=NORMAL;")
-        except Exception as e:
-            logging.warning("Could not apply WAL mode to SQLite DB '%s': %s", db_file, e)
-    client = MlflowClient()
-    if client.get_experiment_by_name(experiment_name) is None:
-        client.create_experiment(experiment_name)
-        logging.info("Created experiment '%s'", experiment_name)
+            os.makedirs(os.path.dirname(db_file) or ".", exist_ok=True)
+        except Exception:
+            pass
+
+        lock_path = f"{db_file}.mlflow_init.lock"
+        with open(lock_path, "w") as lock_fh:
+            # Exclusive lock during migrations/PRAGMA setup
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            except Exception as e:
+                logging.warning("Could not acquire init lock '%s': %s", lock_path, e)
+
+            mlflow.set_tracking_uri(db_path)
+            try:
+                with sqlite3.connect(db_file) as conn:
+                    conn.execute("PRAGMA journal_mode=WAL;")
+                    conn.execute("PRAGMA synchronous=NORMAL;")
+            except Exception as e:
+                logging.warning("Could not apply WAL mode to SQLite DB '%s': %s", db_file, e)
+
+            client = MlflowClient()
+            if client.get_experiment_by_name(experiment_name) is None:
+                client.create_experiment(experiment_name)
+                logging.info("Created experiment '%s'", experiment_name)
+
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+    else:
+        mlflow.set_tracking_uri(db_path)
+        client = MlflowClient()
+        if client.get_experiment_by_name(experiment_name) is None:
+            client.create_experiment(experiment_name)
+            logging.info("Created experiment '%s'", experiment_name)
 
 
 def get_or_create_run(experiment_name: str, run_name: str) -> str:
